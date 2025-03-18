@@ -2,6 +2,7 @@
 
 #![warn(clippy::pedantic)]
 
+mod basemha;
 mod tokut;
 
 use std::{
