@@ -1,0 +1,6 @@
+/target
+/dataset/train.txt
+/dataset/test.txt
+/dataset/train.bin
+/dataset/test.bin
+/dataset/*.tar.gz

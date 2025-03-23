@@ -3,6 +3,7 @@
 #![warn(clippy::pedantic)]
 
 mod basemha;
+mod dataset;
 mod tokut;
 
 use std::{
@@ -10,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use burn::optim::AdamWConfig;
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
@@ -54,6 +56,23 @@ enum CliCommand {
         /// The size of the block of tokens read from file.
         #[arg(short, long, default_value_t = 256)]
         block_size: u64,
+    },
+    /// Train a base ("default") multi-head attention transformer on pre-tokenized data.
+    TrainBaseMHA {
+        /// Pre-tokenized training data.
+        train_file: String,
+        /// Pre-tokenized test data.
+        test_file: String,
+        /// Output directory for model files.
+        artifact_dir: String,
+        #[arg(short, long)]
+        /// Tokenizer vocabulary size.
+        vocab_size: usize,
+        #[arg(short, long, default_value_t = 1024)]
+        context_size: usize,
+        #[arg(short, long, default_value_t = 3)]
+        /// Token ID of the padding token.
+        padding_token: u32,
     },
 }
 
@@ -107,6 +126,30 @@ fn main() {
                 tokut::sample_text_one(Path::new(&tokenized_data_file), &tokenizer, block_size)
                     .unwrap_or_else(|e| panic!("Failed to sample block from file, cause: {e}"));
             println!("Decoded text:\n{text}");
+        }
+        CliCommand::TrainBaseMHA {
+            train_file,
+            test_file,
+            artifact_dir,
+            vocab_size,
+            context_size,
+            padding_token,
+        } => {
+            // use default parameters for everything else.
+            let model_config = basemha::ModelConfig::new(vocab_size)
+                .with_max_seq_len(context_size)
+                .with_padding_token(padding_token);
+
+            let adamw_config = AdamWConfig::new();
+            let wgpu_device = burn::backend::wgpu::WgpuDevice::default();
+            let training_config = basemha::TrainingConfig::new(model_config, adamw_config);
+            basemha::train::<burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>>(
+                &artifact_dir,
+                &train_file,
+                &test_file,
+                training_config,
+                wgpu_device,
+            );
         }
     }
 }

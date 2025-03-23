@@ -5,7 +5,14 @@ edition = "2021"
 description = "Implements and trains small transformer models with various attention types."
 
 [dependencies]
-burn = "0.16.0"
+burn = { version = "0.16.0", features = [
+    "train",
+    "tui",
+    "metrics",
+    "wgpu",
+    "fusion",
+    "std",
+] }
 # Force pre-release to workaround breaking changes
 bincode = "=2.0.0-rc.3"
 bincode_derive = "=2.0.0-rc.3"

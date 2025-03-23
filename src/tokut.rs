@@ -113,37 +113,3 @@ pub fn sample_text_one(
         .decode(mucked, true)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
-
-/// A struct to implement sampling 32-bit aligned chunks from a memory-mapped file.
-/// Mem-mapping is considered here for performance reasons only.
-struct MmapChunkSampler {
-    mmap: memmap2::Mmap,
-    /// Size of block to sample.
-    block_size: usize,
-}
-
-impl MmapChunkSampler {
-    /// Create a new sampler from a file path and block size.
-    pub fn new(path: &Path, block_size: usize) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self { mmap, block_size })
-    }
-
-    /// Sample n chunks in parallel, returning a vector of byte vectors.
-    pub fn sample_chunks(&self, n: usize) -> Vec<&[u32]> {
-        use rayon::prelude::*;
-
-        let max_start = self.mmap.len().saturating_sub(self.block_size * 4);
-
-        (0..n)
-            .into_par_iter()
-            .map(|_| {
-                let mut rng = rand::rng();
-                let start = (rng.random_range(0..=max_start) >> 2) << 2;
-                let en = start + self.block_size * 4;
-                bytemuck::cast_slice(&self.mmap[start..en])
-            })
-            .collect()
-    }
-}
