@@ -5,22 +5,30 @@ edition = "2021"
 description = "Implements and trains small transformer models with various attention types."
 
 [dependencies]
-burn = { version = "0.16.0", features = [
+burn = { path = "../burn/crates/burn", features = [
     "train",
     "tui",
     "metrics",
-    "wgpu",
+    # "wgpu",
+    # "cuda",
     "fusion",
     "std",
 ] }
 # Force pre-release to workaround breaking changes
-bincode = "=2.0.0-rc.3"
-bincode_derive = "=2.0.0-rc.3"
+bincode = "^2.0.0-rc.3"
+bincode_derive = "^2.0.0-rc.3"
 clap = { version = "4.5.32", features = ["derive"] }
 tokenizers = "0.21.1"
 tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
 rand = "0.9.0"
 bytemuck = "1.22.0"
 rayon = "1.10.0"
 memmap2 = "0.9.5"
+burn-tch = { path = "../burn/crates/burn-tch" }
+# burn-ndarray = "0.16.0"
+# burn-cuda = "0.16.0"

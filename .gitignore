@@ -1,6 +1,6 @@
 /target
-/dataset/train.txt
-/dataset/test.txt
-/dataset/train.bin
-/dataset/test.bin
+/dataset/*.txt
+/dataset/*.bin
 /dataset/*.tar.gz
+*.sh
+*log.txt

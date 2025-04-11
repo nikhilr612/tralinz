@@ -1,8 +1,10 @@
 //! Implement an Encoder-Decoder type transformer with _`MultiHead`_ attention.
 
+use std::path::PathBuf;
+
 use burn::{
     config::Config,
-    data::dataloader::DataLoaderBuilder,
+    // data::dataloader::DataLoaderBuilder,
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::{Module, Param},
     nn::{
@@ -13,16 +15,15 @@ use burn::{
     },
     optim::AdamWConfig,
     prelude::Backend,
-    record::CompactRecorder,
     tensor::{backend::AutodiffBackend, Bool, Tensor},
-    train::{
-        metric::{AccuracyMetric, LossMetric},
-        ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
-    },
+    train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep},
 };
-use tracing::{debug_span, info_span, trace};
+use tracing::{debug, debug_span, info, info_span, trace};
 
-use crate::dataset::{open_mmap_dataset, MmapChunkBatch};
+use crate::{
+    dataset::{open_mmap_dataset, ChunkSampler, MmapChunkBatch},
+    learn::ShoddyLearner,
+};
 
 #[derive(Debug, Module)]
 /// Module for weight tying embedder with head.
@@ -50,7 +51,7 @@ impl TiedEmbedderConfig {
 }
 
 impl<B: Backend> TiedEmbedder<B> {
-    /// Map Tensor of TokenIDs to their embeddings.
+    /// Map Tensor of Token IDs to their embeddings.
     fn embed(&self, tokenids: Tensor<B, 2, burn::prelude::Int>) -> Tensor<B, 3> {
         burn::tensor::module::embedding(self.weights.val(), tokenids)
     }
@@ -62,7 +63,8 @@ impl<B: Backend> TiedEmbedder<B> {
     fn prelogits(&self, penult: Tensor<B, 3>) -> Tensor<B, 3> {
         // Penult - (B, T, C) = (Batch, SeqLen, Embedding dim)
         // Output - (B, T, V) = (Batch, SeqLen, Vocab Size)
-        self.weights.val().unsqueeze::<3>().matmul(penult)
+        let w = self.weights.val().transpose().unsqueeze::<3>();
+        penult.matmul(w)
     }
 }
 
@@ -124,7 +126,7 @@ pub struct ModelConfig {
     #[config(default = "768")]
     /// Embedding dimension of the model.
     d_model: usize,
-    #[config(default = "16")]
+    #[config(default = "8")]
     /// Number of attention heads in multi-head attention.
     n_heads: usize,
     #[config(default = "3072")]
@@ -190,7 +192,7 @@ impl<B: Backend> Model<B> {
 
         let tokens = batch.cat_tensor;
         let pad_mask = batch.pad_mask;
-        let indices = batch.indices;
+        // let indices = batch.indices;
 
         let B = tokens.dims()[0]; // batch size.
         let T = tokens.dims()[1]; // sequence length.
@@ -199,7 +201,7 @@ impl<B: Backend> Model<B> {
         let upper_tri: Tensor<B, 2, Bool> = Tensor::tril_mask([T, T], 0, device);
         let causal_mask: Tensor<B, 3, Bool> = upper_tri.unsqueeze::<3>().repeat_dim(0, B);
 
-        let x = self.token_embedder.embed(tokens);
+        let x = self.token_embedder.embed(tokens); // (B,T) (-> (B,T,V)) -> (B,T,C)
 
         // position embeddings just work as learned biases in this model.
         // TODO: Explore rotary embeddings.
@@ -216,9 +218,12 @@ impl<B: Backend> Model<B> {
             .mask_attn(causal_mask)
             .mask_pad(pad_mask);
 
+        trace!("Forwarding to masked attention..");
+
         let masked_mha_output = self.masked_mha.forward(masked_mha_input);
         let mut xl = masked_mha_output.context;
 
+        trace!("Forwarding to blocks..");
         for block in &self.blocks {
             xl = block.forward(xl);
         }
@@ -230,8 +235,7 @@ impl<B: Backend> Model<B> {
 
         // (B, T, V)
         let prelogits = self.token_embedder.prelogits(xl);
-
-        let logits = prelogits.select(1, indices).squeeze::<2>(1); // (B, V)
+        let logits = prelogits.slice([0..B, (T - 1)..T]).squeeze::<2>(1); // grab the next prediction
         trace!("Finished processing. Obtained logits;");
 
         logits
@@ -258,9 +262,13 @@ impl<B: Backend> Model<B> {
 
 impl<B: AutodiffBackend> TrainStep<MmapChunkBatch<B>, ClassificationOutput<B>> for Model<B> {
     fn step(&self, item: MmapChunkBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        let span = debug_span!("train_step");
+        let _guard = span.enter();
+
         let device = &item.cat_tensor.device();
         let item = self.forward_classification(item, device);
-
+        trace!("Computed classification results and loss, backwarding...");
+        debug!("Mean Training Loss: {}", item.loss.clone().mean());
         TrainOutput::new(self, item.loss.backward(), item)
     }
 }
@@ -278,21 +286,22 @@ pub struct TrainingConfig {
     pub optimizer: AdamWConfig,
     #[config(default = "100")]
     pub num_epochs: usize,
-    #[config(default = "10")]
+    #[config(default = "1")] // use 8
     pub batch_size: usize,
-    #[config(default = "8")]
+    #[config(default = "4")]
     pub num_workers: usize,
     #[config(default = 42)]
     pub seed: u64,
     // TODO: Re-place with custom scheduler with warmup if necessary
     #[config(default = "CosineAnnealingLrSchedulerConfig::new(2.4e-4, 8)")]
     pub lr_scheduler: CosineAnnealingLrSchedulerConfig,
+    pub max_iter: Option<usize>,
 }
 
 pub fn train<B: AutodiffBackend>(
     artifact_dir: &str,
     train_file: &str,
-    test_file: &str,
+    test_file: Option<&str>,
     config: TrainingConfig,
     device: B::Device,
 ) {
@@ -305,7 +314,7 @@ pub fn train<B: AutodiffBackend>(
 
     B::seed(config.seed);
 
-    let (train_dataset, train_batcher) = open_mmap_dataset(
+    let (train_dataset, train_batcher) = open_mmap_dataset::<B>(
         train_file,
         config.model.max_seq_len + 1,
         config.model.padding_token,
@@ -315,51 +324,69 @@ pub fn train<B: AutodiffBackend>(
         panic!("Failed to open training dataset. Cause: {e}");
     });
 
-    let (test_dataset, test_batcher) = open_mmap_dataset(
-        test_file,
-        config.model.max_seq_len + 1,
-        config.model.padding_token,
-        device.clone(),
-    )
-    .unwrap_or_else(|e| {
-        panic!("Failed to open training dataset. Cause: {e}");
-    });
+    info!("Loaded train dataset.");
 
-    let dataloader_train = DataLoaderBuilder::new(train_batcher)
-        .batch_size(config.batch_size)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .build(train_dataset);
+    // let (test_dataset, test_batcher) = open_mmap_dataset::<B>(
+    //     test_file,
+    //     config.model.max_seq_len + 1,
+    //     config.model.padding_token,
+    //     device.clone(),
+    // )
+    // .unwrap_or_else(|e| {
+    //     panic!("Failed to open training dataset. Cause: {e}");
+    // });
 
-    let dataloader_test = DataLoaderBuilder::new(test_batcher)
-        .batch_size(config.batch_size)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .build(test_dataset);
+    // info!("Loaded test dataset.");
+
+    // let dataloader_train = DataLoaderBuilder::new(train_batcher)
+    //     .batch_size(config.batch_size)
+    //     .shuffle(config.seed)
+    //     .num_workers(config.num_workers)
+    //     .build(train_dataset);
+
+    let train_sampler = ChunkSampler::new(train_dataset, train_batcher, 1, config.batch_size);
+
+    trace!("Created training data loader.");
+    // let dataloader_test = DataLoaderBuilder::new(test_batcher)
+    //     .batch_size(config.batch_size)
+    //     .shuffle(config.seed)
+    //     .num_workers(config.num_workers)
+    //     .build(test_dataset);
 
     let lr_schedule = config
         .lr_scheduler
         .init()
         .expect("Cosine learning rate schedule should be valid.");
 
-    let learner = LearnerBuilder::new(artifact_dir)
-        .metric_train_numeric(AccuracyMetric::new())
-        .metric_valid_numeric(AccuracyMetric::new())
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
-        .devices(vec![device.clone()])
-        .num_epochs(config.num_epochs)
-        .summary()
-        .build(
-            config.model.init::<B>(&device),
-            config.optimizer.init(),
-            lr_schedule,
-        );
+    // let learner = LearnerBuilder::new(artifact_dir)
+    //     .metric_train_numeric(AccuracyMetric::new())
+    //     .metric_valid_numeric(AccuracyMetric::new())
+    //     .metric_train_numeric(LossMetric::new())
+    //     .metric_valid_numeric(LossMetric::new())
+    //     .with_file_checkpointer(CompactRecorder::new())
+    //     .devices(vec![device.clone()])
+    //     .num_epochs(config.num_epochs)
+    //     .summary()
+    //     .build(
+    //         config.model.init::<B>(&device),
+    //         config.optimizer.init(),
+    //         lr_schedule,
+    //     );
 
-    let model_trained = learner.fit(dataloader_train, dataloader_test);
+    let shoddy_learner = ShoddyLearner::new(
+        config.model.init(&device),
+        lr_schedule,
+        config.optimizer.init(),
+        config.num_epochs,
+        config.max_iter,
+        None,
+        PathBuf::from(artifact_dir),
+    );
 
-    model_trained
-        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
-        .expect("Trained model should be saved successfully");
+    // let model_trained = learner.fit(dataloader_train, dataloader_test);
+    // model_trained
+    //     .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+    //     .expect("Trained model should be saved successfully");
+
+    shoddy_learner.train(train_sampler, &device);
 }

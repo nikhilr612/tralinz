@@ -1,9 +1,12 @@
+use std::collections::VecDeque;
+
 use burn::{
     data::{dataloader::batcher::Batcher, dataset::Dataset},
     prelude::Backend,
     tensor::{Bool, Device, Int, Shape, Tensor},
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rand::{rngs::ThreadRng, Rng};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use tracing::{debug, info, instrument, trace, Span};
 
 pub struct MmapRawDataset {
@@ -44,23 +47,21 @@ pub struct MmapChunkBatch<B: Backend> {
     pub pad_mask: Tensor<B, 2, Bool>,
     /// The target tokens expected (against which loss is measured) in training.
     pub targets: Option<Tensor<B, 1, Int>>,
-    /// The indices of final sequence embedding to sample.
-    pub indices: Tensor<B, 1, Int>,
 }
 
-impl<B: Backend> FromIterator<MmapChunkBatchElement<B>> for MmapChunkBatch<B> {
-    #[instrument(skip(iter))]
-    fn from_iter<T: IntoIterator<Item = MmapChunkBatchElement<B>>>(iter: T) -> Self {
-        let mut tensors = Vec::new();
-        let mut masks = Vec::new();
-        let mut targets = Vec::new();
-        let mut indices = Vec::new();
+impl<B: Backend> MmapChunkBatch<B> {
+    fn from_iter(
+        len: usize,
+        batch_iter: impl Iterator<Item = MmapChunkBatchElement<B>>,
+    ) -> MmapChunkBatch<B> {
+        let mut tensors = Vec::with_capacity(len);
+        let mut masks = Vec::with_capacity(len);
+        let mut targets = Vec::with_capacity(len);
 
-        for elm in iter {
+        for elm in batch_iter {
             tensors.push(elm.token_ids);
             masks.push(elm.pad_mask);
             targets.push(elm.targets);
-            indices.push(elm.indices);
         }
 
         debug!(
@@ -73,7 +74,6 @@ impl<B: Backend> FromIterator<MmapChunkBatchElement<B>> for MmapChunkBatch<B> {
             cat_tensor: Tensor::cat(tensors, 0),
             pad_mask: Tensor::cat(masks, 0),
             targets: Some(Tensor::cat(targets, 0)),
-            indices: Tensor::cat(indices, 0),
         }
     }
 }
@@ -82,46 +82,33 @@ struct MmapChunkBatchElement<B: Backend> {
     token_ids: Tensor<B, 2, Int>,
     pad_mask: Tensor<B, 2, Bool>,
     targets: Tensor<B, 1, Int>,
-    indices: Tensor<B, 1, Int>,
 }
 
 impl<B: Backend> MmapChunkBatcher<B> {
     /// Take a block of token IDs, apply auto-regressive padding, i.e, for a block of length `N` generate `N` training samples, each of length 1, 2, .., N.
     /// Pre-condition: All inputs must be of size `block_size`. Usually, block_size = max_seq_len + 1
     #[instrument(skip(self, block))]
-    fn gen_auto_regressive_pad(&self, mut block: Vec<u32>) -> MmapChunkBatchElement<B> {
-        let mut tensors = Vec::new();
-        let mut targets = Vec::new();
+    fn gen_auto_regressive_pad(&self, block: Vec<u32>) -> MmapChunkBatchElement<B> {
+        assert!(!block.is_empty(), "Must provide a non-empty block to pad.");
 
         let max_length = block.len() - 1;
 
-        for i in max_length..0 {
-            targets.push(block[i]);
-            block[i] = self.padding_token;
+        let temp: Tensor<B, 1, Int> = Tensor::from_ints(&block[..max_length], &self.device); // last one is always a target or pad.
+        let element = temp
+            // .one_hot(self.vocab_size), don't one-hot encode
+            .unsqueeze::<2>();
 
-            let temp: Tensor<B, 1, Int> = Tensor::from_ints(&block[..max_length], &self.device); // last one is always a target or pad.
-            let element = temp
-                // .one_hot(self.vocab_size), don't one-hot encode
-                .unsqueeze::<2>();
-            // .float();
-            tensors.push(element);
-        }
+        let mut tensors = Tensor::repeat_dim(element, 0, max_length);
+        let targets = Tensor::from_ints(&block[1..=max_length], &self.device);
 
-        tensors.reverse();
-        let mask = Tensor::tril_mask(Shape::new([max_length, max_length]), 0, &self.device);
-        debug!(tl = tensors.len(), "Will catenate tensors;");
-        let tensors = Tensor::cat(tensors, 0);
-        let targets: Tensor<B, 1, Int> = Tensor::from_ints(&targets[..], &self.device);
-        let indices: Tensor<B, 1, Int> = Tensor::arange(
-            0..(max_length.try_into().expect("max length should fit in i64")),
-            &self.device,
-        );
+        // use upper triangular mask, so that model always continues from (T-1) seq. position for all inputs.
+        let mask = Tensor::triu_mask(Shape::new([max_length, max_length]), 0, &self.device);
+        tensors = tensors.mask_fill(mask.clone(), self.padding_token); // is this really needed? (ig Wq, Wk, Wv need to see padding emb.)
 
         MmapChunkBatchElement {
             token_ids: tensors,
             pad_mask: mask,
             targets,
-            indices,
         }
     }
 }
@@ -137,16 +124,16 @@ impl<B: Backend> Batcher<Vec<u32>, MmapChunkBatch<B>> for MmapChunkBatcher<B> {
             .into_par_iter()
             .map(|block| {
                 let _guard = batch_span.enter();
-                trace!("Converting block to one-hot tensors with padding");
+                trace!("Converting block to tensors with padding");
                 self.gen_auto_regressive_pad(block)
             })
             .collect();
 
         trace!(
-            "Stacking {} batch elements (tensors and padding masks). This happens serially.",
+            "Concatenating {} batch elements (tensors and padding masks). This happens serially.",
             batch_vec.len()
         );
-        MmapChunkBatch::from_iter(batch_vec) // Serial iteration over the batch elements.
+        MmapChunkBatch::from_iter(batch_vec.len(), batch_vec.into_iter()) // Serial iteration over the batch elements.
     }
 }
 
@@ -190,4 +177,79 @@ pub fn open_mmap_dataset<B: Backend>(
 
     debug!("Created dataset with block_size={}", block_size);
     Ok((dataset, batcher))
+}
+
+pub struct ChunkSampler<B: Backend> {
+    /// Batches queued-up and read from disk already.
+    queue: VecDeque<MmapChunkBatch<B>>,
+    /// Number of batches to read and maintain.
+    q_size: usize,
+    batch_size: usize,
+    /// Seeded random number generator.
+    rng: ThreadRng,
+    dataset: MmapRawDataset,
+    batcher: MmapChunkBatcher<B>,
+}
+
+impl<B: Backend> ChunkSampler<B> {
+    pub fn new(
+        dataset: MmapRawDataset,
+        batcher: MmapChunkBatcher<B>,
+        queue_size: usize,
+        batch_size: usize,
+    ) -> Self {
+        let rng = rand::rng();
+
+        Self {
+            queue: VecDeque::with_capacity(queue_size),
+            q_size: queue_size,
+            batch_size,
+            rng,
+            dataset,
+            batcher,
+        }
+    }
+}
+
+impl<B: Backend> Iterator for ChunkSampler<B> {
+    type Item = MmapChunkBatch<B>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.queue.is_empty() {
+            let dlen = self.dataset.len();
+            let nvars = self.batch_size * self.q_size;
+            debug!("Chunk buffer is empty; refilling with {nvars} chunks");
+
+            // has to be generated before hand.
+            let rvs: Vec<_> = (0..nvars).map(|_| self.rng.random::<f64>()).collect();
+
+            let v: Vec<_> = rvs
+                .into_par_iter()
+                .map(|rv| {
+                    // potential precision loss.
+                    let index = ((rv * (dlen as f64)).floor() as usize).min(dlen - 1);
+                    let read = self.dataset.get(index).expect("msg");
+                    self.batcher.gen_auto_regressive_pad(read)
+                })
+                .chunks(self.batch_size)
+                .map(|chunk| MmapChunkBatch::from_iter(chunk.len(), chunk.into_iter()))
+                .collect();
+            trace!("Finished generating batches in parallel.");
+            self.queue.extend(v);
+        }
+
+        self.queue.pop_front()
+    }
+}
+
+pub fn good_size_for(division_width: f64, pv: f64) -> usize {
+    if division_width <= 1.0 {
+        return 1;
+    }
+    assert!(pv > 0.0, "p-value must be non-negative");
+    assert!(pv < 1.0, "pv must be < 1.0");
+    let f = (division_width.ln() - pv.ln()) / (division_width.ln() - (division_width - 1.0).ln());
+    let r = f.ceil() as usize;
+    trace!("Good size for width {division_width} and pv {pv} is {r}");
+    r
 }

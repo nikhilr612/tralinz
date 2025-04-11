@@ -4,6 +4,7 @@
 
 mod basemha;
 mod dataset;
+mod learn;
 mod tokut;
 
 use std::{
@@ -13,8 +14,8 @@ use std::{
 
 use burn::optim::AdamWConfig;
 use clap::Parser;
-use tracing::info;
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, trace};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Command line arguments for the binary.
 #[derive(Parser)]
@@ -59,12 +60,12 @@ enum CliCommand {
     },
     /// Train a base ("default") multi-head attention transformer on pre-tokenized data.
     TrainBaseMHA {
+        /// Output directory for model files.
+        artifact_dir: String,
         /// Pre-tokenized training data.
         train_file: String,
         /// Pre-tokenized test data.
-        test_file: String,
-        /// Output directory for model files.
-        artifact_dir: String,
+        test_file: Option<String>,
         #[arg(short, long)]
         /// Tokenizer vocabulary size.
         vocab_size: usize,
@@ -73,11 +74,15 @@ enum CliCommand {
         #[arg(short, long, default_value_t = 3)]
         /// Token ID of the padding token.
         padding_token: u32,
+        #[arg(short, long, default_value_t = 768)]
+        d_model: usize,
     },
 }
 
 fn main() {
-    FmtSubscriber::builder().init();
+    FmtSubscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     let args = CliArgs::parse();
     match args.command {
@@ -87,46 +92,18 @@ fn main() {
             output_file,
             safe_big_endian,
             buffer_line_count,
-        } => {
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).unwrap_or_else(|e| {
-                panic!("Failed to read tokenizer from file {tokenizer_path}, cause: {e}")
-            });
-            let input_file = File::open(&text_file).unwrap_or_else(|e| {
-                panic!("Failed to open input text file {text_file}, cause: {e}")
-            });
-            let output_file = File::options()
-                .create(true)
-                .append(true)
-                .open(output_file.map_or_else(
-                    || Path::new(&text_file).with_extension("bin"),
-                    PathBuf::from,
-                ))
-                .unwrap_or_else(|e| panic!("Failed to open output file, cause: {e}"));
-            info!(text_file, "Starting tokenization");
-            tokut::tokenize_file(
-                &tokenizer,
-                input_file,
-                output_file,
-                safe_big_endian,
-                buffer_line_count,
-            )
-            .unwrap_or_else(|e| {
-                panic!("Tokenization of input file {text_file} failed.\n\tCause: {e}");
-            });
-        }
+        } => handle_pre_tokenize(
+            &tokenizer_path,
+            &text_file,
+            output_file,
+            safe_big_endian,
+            buffer_line_count,
+        ),
         CliCommand::SampleBlock {
             tokenized_data_file,
             tokenizer_path,
             block_size,
-        } => {
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).unwrap_or_else(|e| {
-                panic!("Failed to read tokenizer from file {tokenizer_path}, cause: {e}")
-            });
-            let text =
-                tokut::sample_text_one(Path::new(&tokenized_data_file), &tokenizer, block_size)
-                    .unwrap_or_else(|e| panic!("Failed to sample block from file, cause: {e}"));
-            println!("Decoded text:\n{text}");
-        }
+        } => handle_sample_block(&tokenized_data_file, &tokenizer_path, block_size),
         CliCommand::TrainBaseMHA {
             train_file,
             test_file,
@@ -134,22 +111,86 @@ fn main() {
             vocab_size,
             context_size,
             padding_token,
-        } => {
-            // use default parameters for everything else.
-            let model_config = basemha::ModelConfig::new(vocab_size)
-                .with_max_seq_len(context_size)
-                .with_padding_token(padding_token);
-
-            let adamw_config = AdamWConfig::new();
-            let wgpu_device = burn::backend::wgpu::WgpuDevice::default();
-            let training_config = basemha::TrainingConfig::new(model_config, adamw_config);
-            basemha::train::<burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>>(
-                &artifact_dir,
-                &train_file,
-                &test_file,
-                training_config,
-                wgpu_device,
-            );
-        }
+            d_model,
+        } => handle_train_base_mha(
+            &train_file,
+            test_file.as_deref(),
+            &artifact_dir,
+            vocab_size,
+            context_size,
+            padding_token,
+            d_model,
+        ),
     }
+}
+
+fn handle_pre_tokenize(
+    tokenizer_path: &str,
+    text_file: &str,
+    output_file: Option<String>,
+    safe_big_endian: bool,
+    buffer_line_count: usize,
+) {
+    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).unwrap_or_else(|e| {
+        panic!("Failed to read tokenizer from file {tokenizer_path}, cause: {e}")
+    });
+    let input_file = File::open(text_file)
+        .unwrap_or_else(|e| panic!("Failed to open input text file {text_file}, cause: {e}"));
+    let output_file = File::options()
+        .create(true)
+        .append(true)
+        .open(output_file.map_or_else(
+            || Path::new(&text_file).with_extension("bin"),
+            PathBuf::from,
+        ))
+        .unwrap_or_else(|e| panic!("Failed to open output file, cause: {e}"));
+    info!(text_file, "Starting tokenization");
+    tokut::tokenize_file(
+        &tokenizer,
+        input_file,
+        output_file,
+        safe_big_endian,
+        buffer_line_count,
+    )
+    .unwrap_or_else(|e| {
+        panic!("Tokenization of input file {text_file} failed.\n\tCause: {e}");
+    });
+}
+
+fn handle_sample_block(tokenized_data_file: &str, tokenizer_path: &str, block_size: u64) {
+    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).unwrap_or_else(|e| {
+        panic!("Failed to read tokenizer from file {tokenizer_path}, cause: {e}")
+    });
+    let text = tokut::sample_text_one(Path::new(tokenized_data_file), &tokenizer, block_size)
+        .unwrap_or_else(|e| panic!("Failed to sample block from file, cause: {e}"));
+    println!("Decoded text:\n{text}");
+}
+
+fn handle_train_base_mha(
+    train_file: &str,
+    test_file: Option<&str>,
+    artifact_dir: &str,
+    vocab_size: usize,
+    context_size: usize,
+    padding_token: u32,
+    d_model: usize,
+) {
+    let model_config = basemha::ModelConfig::new(vocab_size)
+        .with_max_seq_len(context_size)
+        .with_d_model(d_model)
+        .with_d_ffn(4 * d_model)
+        .with_padding_token(padding_token);
+
+    let adamw_config = AdamWConfig::new();
+    let device = burn_tch::LibTorchDevice::Cuda(0); // burn_cuda::CudaDevice::new(0);
+    let training_config = basemha::TrainingConfig::new(model_config, adamw_config);
+
+    trace!("Created training configuration.");
+    basemha::train::<burn::backend::Autodiff<burn_tch::LibTorch>>(
+        artifact_dir,
+        train_file,
+        test_file,
+        training_config,
+        device,
+    );
 }
