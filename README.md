@@ -10,12 +10,13 @@ This project focuses on implementing small-scale models to explore architectural
 ## Datasets
 Transformers are notoriously data-hungry; notwithstanding datasets used in this project will be limited in size.
 1. [OpenWebText 2M Subset](https://www.kaggle.com/datasets/nikhilr612/openwebtext-2m-subset)
+1. [Common Crawl Micro Subset English](https://www.kaggle.com/datasets/nikhilr612/common-crawl-micro-subset-english)
 
 ## Dependencies
 - [burn](https://burn.dev) (0.16.0) - Deep learning framework
 - clap (4.5.32) - Command line argument parser
 - [tokenizers](https://docs.rs/tokenizers/latest/tokenizers/) (0.21.1) - Text tokenization library
-- tracing (0.1.41) - Application-level tracing
+- [tracing](https://docs.rs/tracing/latest/tracing/) (0.1.41) - Application-level tracing
 - tracing-subscriber (0.3.19) - Tracing implementation
 - rand (0.9.0) - Random number generation
 - bytemuck (1.22.0) - Memory manipulation utilities
