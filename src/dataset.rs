@@ -96,10 +96,10 @@ impl<B: Backend> MmapChunkBatcher<B> {
         let temp: Tensor<B, 1, Int> = Tensor::from_ints(&block[..max_length], &self.device); // last one is always a target or pad.
         let element = temp
             // .one_hot(self.vocab_size), don't one-hot encode
-            .unsqueeze::<2>();
+            .unsqueeze::<2>(); // (1, T)
 
-        let mut tensors = Tensor::repeat_dim(element, 0, max_length);
-        let targets = Tensor::from_ints(&block[1..=max_length], &self.device);
+        let mut tensors = Tensor::repeat_dim(element, 0, max_length); // (B, T)
+        let targets = Tensor::from_ints(&block[1..=max_length], &self.device).flip([0]); // (B,)
 
         // use upper triangular mask, so that model always continues from (T-1) seq. position for all inputs.
         let mask = Tensor::triu_mask(Shape::new([max_length, max_length]), 0, &self.device);

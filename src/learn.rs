@@ -115,7 +115,7 @@ where
                 trace!(iteration, "Updated model based on current batch.");
             }
 
-            trace!("Checkpointing..");
+            info!("Checkpointing..");
             checkpointer_model
                 .save(epoch, self.model.clone().into_record())
                 .unwrap_or_else(|e| {

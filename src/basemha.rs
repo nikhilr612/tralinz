@@ -268,7 +268,15 @@ impl<B: AutodiffBackend> TrainStep<MmapChunkBatch<B>, ClassificationOutput<B>> f
         let device = &item.cat_tensor.device();
         let item = self.forward_classification(item, device);
         trace!("Computed classification results and loss, backwarding...");
-        debug!("Mean Training Loss: {}", item.loss.clone().mean());
+        debug!(
+            "Mean Training Loss: {:?}",
+            item.loss
+                .clone()
+                .mean()
+                .to_data()
+                .to_vec()
+                .unwrap_or(vec![f32::INFINITY; 0])
+        );
         TrainOutput::new(self, item.loss.backward(), item)
     }
 }
