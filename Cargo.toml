@@ -5,7 +5,7 @@ edition = "2021"
 description = "Implements and trains small transformer models with various attention types."
 
 [dependencies]
-burn = { path = "../burn/crates/burn", features = [
+burn = { path = "./deps/burn/crates/burn", features = [
     "train",
     "tui",
     "metrics",
@@ -29,6 +29,6 @@ rand = "0.9.0"
 bytemuck = "1.22.0"
 rayon = "1.10.0"
 memmap2 = "0.9.5"
-burn-tch = { path = "../burn/crates/burn-tch" }
+burn-tch = { path = "./deps/burn/crates/burn-tch" }
 # burn-ndarray = "0.16.0"
 # burn-cuda = "0.16.0"

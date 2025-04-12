@@ -1,19 +1,19 @@
 {
   "model": {
     "vocab_size": 12288,
-    "max_seq_len": 100,
+    "max_seq_len": 108,
     "d_model": 192,
     "n_heads": 8,
     "d_ffn": 768,
-    "dropout": 0.2,
-    "attention_dropout": 0.1,
+    "dropout": 0.08,
+    "attention_dropout": 0.08,
     "initializer": {
       "Uniform": {
         "min": -0.5,
         "max": 0.5
       }
     },
-    "padding_token": 3
+    "padding_token": 1
   },
   "optimizer": {
     "grad_clipping": null,
@@ -23,7 +23,7 @@
     "weight_decay": 0.0001
   },
   "max_iter": null,
-  "num_epochs": 100,
+  "num_epochs": 80,
   "batch_size": 1,
   "num_workers": 4,
   "seed": 42,
