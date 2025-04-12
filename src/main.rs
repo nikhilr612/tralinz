@@ -2,6 +2,7 @@
 
 #![warn(clippy::pedantic)]
 
+mod args;
 mod basemha;
 mod dataset;
 mod learn;
@@ -12,72 +13,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use burn::optim::AdamWConfig;
+use args::{CliArgs, CliCommand};
 use clap::Parser;
-use tracing::{info, trace};
+use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-/// Command line arguments for the binary.
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-struct CliArgs {
-    #[command(subcommand)]
-    command: CliCommand,
-}
-
-#[derive(clap::Subcommand)]
-enum CliCommand {
-    /// Tokenize training and validation data (provided as text files) and dump token IDs in binary format.
-    PreTokenize {
-        /// Path to tokenizer.
-        #[arg(short, long)]
-        tokenizer_path: String,
-        /// Path to text file to tokenize.
-        text_file: String,
-        /// Path to output file to write tokens to. If not specified, output file is the input path with `.bin` extension.
-        #[arg(short, long)]
-        output_file: Option<String>,
-        /// Enforce endianess, and write token IDs in big endian.
-        #[arg(long = "endian")]
-        safe_big_endian: bool,
-        /// The number of lines per chunk of text processed
-        #[arg(short, long, default_value_t = 1024)]
-        buffer_line_count: usize,
-    },
-    /// Randomly sample a block of tokens from `.bin` file and print the decoded text.
-    /// The main use-case for this is to verify tokenizer decoding, as well as the pre-tokenized data.
-    /// Currently, only native endian token IDs are supported.
-    SampleBlock {
-        // TODO: Add flag for checking big-endian token IDs.
-        /// File containing pre-tokenized data.
-        tokenized_data_file: String,
-        /// Path to tokenizer.
-        #[arg(short, long)]
-        tokenizer_path: String,
-        /// The size of the block of tokens read from file.
-        #[arg(short, long, default_value_t = 256)]
-        block_size: u64,
-    },
-    /// Train a base ("default") multi-head attention transformer on pre-tokenized data.
-    TrainBaseMHA {
-        /// Output directory for model files.
-        artifact_dir: String,
-        /// Pre-tokenized training data.
-        train_file: String,
-        /// Pre-tokenized test data.
-        test_file: Option<String>,
-        #[arg(short, long)]
-        /// Tokenizer vocabulary size.
-        vocab_size: usize,
-        #[arg(short, long, default_value_t = 1024)]
-        context_size: usize,
-        #[arg(short, long, default_value_t = 3)]
-        /// Token ID of the padding token.
-        padding_token: u32,
-        #[arg(short, long, default_value_t = 768)]
-        d_model: usize,
-    },
-}
 
 fn main() {
     FmtSubscriber::builder()
@@ -104,23 +43,27 @@ fn main() {
             tokenizer_path,
             block_size,
         } => handle_sample_block(&tokenized_data_file, &tokenizer_path, block_size),
-        CliCommand::TrainBaseMHA {
+        CliCommand::Train {
+            variant,
             train_file,
             test_file,
             artifact_dir,
+            train_config,
+        } => {
+            variant.train(
+                &train_file,
+                test_file.as_deref(),
+                &artifact_dir,
+                &train_config,
+            );
+        }
+        CliCommand::GenerateConfig {
+            variant,
             vocab_size,
-            context_size,
-            padding_token,
-            d_model,
-        } => handle_train_base_mha(
-            &train_file,
-            test_file.as_deref(),
-            &artifact_dir,
-            vocab_size,
-            context_size,
-            padding_token,
-            d_model,
-        ),
+            output_path,
+        } => {
+            variant.gen_config(vocab_size, &output_path);
+        }
     }
 }
 
@@ -164,33 +107,4 @@ fn handle_sample_block(tokenized_data_file: &str, tokenizer_path: &str, block_si
     let text = tokut::sample_text_one(Path::new(tokenized_data_file), &tokenizer, block_size)
         .unwrap_or_else(|e| panic!("Failed to sample block from file, cause: {e}"));
     println!("Decoded text:\n{text}");
-}
-
-fn handle_train_base_mha(
-    train_file: &str,
-    test_file: Option<&str>,
-    artifact_dir: &str,
-    vocab_size: usize,
-    context_size: usize,
-    padding_token: u32,
-    d_model: usize,
-) {
-    let model_config = basemha::ModelConfig::new(vocab_size)
-        .with_max_seq_len(context_size)
-        .with_d_model(d_model)
-        .with_d_ffn(4 * d_model)
-        .with_padding_token(padding_token);
-
-    let adamw_config = AdamWConfig::new();
-    let device = burn_tch::LibTorchDevice::Cuda(0); // burn_cuda::CudaDevice::new(0);
-    let training_config = basemha::TrainingConfig::new(model_config, adamw_config);
-
-    trace!("Created training configuration.");
-    basemha::train::<burn::backend::Autodiff<burn_tch::LibTorch>>(
-        artifact_dir,
-        train_file,
-        test_file,
-        training_config,
-        device,
-    );
 }
